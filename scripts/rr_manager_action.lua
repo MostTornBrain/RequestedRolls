@@ -2,10 +2,43 @@
 --Added original function to fall through if not overridden
 local fRollOriginal = nil;
 
+-- Override needed for 3.5/PFRPG to apply "stable" effect on a manual roll for stabilization from dying.
+local applyStableEffectOriginal;
+
 function onInit()
 	fRollOriginal = ActionsManager.roll;
     ActionsManager.roll = rollOverride;
 	OOBManager.registerOOBMsgHandler(OOB_MSGTYPE_APPLYROLL, handleApplyRollRR);
+
+	if ActorManager35E then
+		applyStableEffectOriginal = ActorManager35E.applyStableEffect;
+		ActorManager35E.applyStableEffect = applyStableEffect;
+	end
+end
+
+-- Override of the ActionManager35E to allow stable effect to be applied to the CT by a player.
+-- This is needed for when an auto-stabilization roll is triggered on turn end and the player has
+-- the option enabled to prompt for save rolls.
+-- Without this function, the player can make the roll manually, but the success result of "stable" 
+-- will not be applied to the combat tracker.
+function applyStableEffect(rActor)
+	if (Session.IsHost) then
+		applyStableEffectOriginal(rActor);
+	else
+		if EffectManager35E.hasEffectCondition(rActor, "Stable") then return; end
+	
+		local aEffect = { sName = "Stable", nDuration = 0 };
+		if ActorManager.getFaction(rActor) ~= "friend" then
+			aEffect.nGMOnly = 1;
+		end
+		EffectManager.notifyApply(aEffect, ActorManager.getCTNodeName(rActor));
+	end
+end
+
+-- Helper function to determine if the actor is controlled by a player.
+-- This allwos compatibility with extensions that allow NPCs to be assigned to a PC for direct player control of the NPC.
+function isPlayerControlled(rActor)
+	return  ActorManager.isPC(rActor) or (FriendZone and FriendZone.isCohort(rActor));		
 end
 
 ---Helper function for if strings start with a certain sequence
@@ -40,7 +73,7 @@ function rollOverride(rSource, vTargets, rRoll, bMultiTarget)
 		DiceManager.onPreEncodeRoll(rRoll);
 		--start where the new code is inserted
 		--Checks if this save could be a roll that needs to be added but wasn't generated from console
-		if (RR.isManualSaveRollPcOn() and ActorManager.isPC(rSource)) or (RR.isManualSaveRollNpcOn() and not ActorManager.isPC(rSource)) then
+		if (RR.isManualSaveRollPcOn() and isPlayerControlled(rSource)) or (RR.isManualSaveRollNpcOn() and not isPlayerControlled(rSource)) then
 			--Then checks if the roll is a VS roll, these are already sent to the specific player by built in ruleset code
 			if rRoll.sSaveDesc and starts(rRoll.sSaveDesc, "[SAVE VS") then
 				ManualRollManager.addRoll(rRoll, rSource, vTargets);
@@ -101,7 +134,7 @@ function handleApplyRollRR(msgOOB)
 		if RR.bDebug then Debug.chat("postsendroll", rRoll); end
 		--if the roll is being passed because of popup status and the user is not set to get the popup rolls, then roll directly.
 		--Otherwise add it to the popup menu
-		if rRoll.bPopup and (not (RR.isManualSaveRollPcOn() and ActorManager.isPC(rActor)) or (RR.isManualSaveRollNpcOn() and not ActorManager.isPC(rActor))) then
+		if rRoll.bPopup and (not (RR.isManualSaveRollPcOn() and isPlayerControlled(rActor)) or (RR.isManualSaveRollNpcOn() and not isPlayerControlled(rActor))) then
 			local rThrow = ActionsManager.buildThrow(rActor, nil, rRoll, true);
 			Comm.throwDice(rThrow);
 		else
@@ -117,7 +150,7 @@ function handleApplyRollRR(msgOOB)
 		end
 		--if the roll is being passed because of popup status and the user is not set to get the popup rolls, then roll directly.
 		--Otherwise add it to the popup menu
-		if rRoll.bPopup and (not (RR.isManualSaveRollPcOn() and ActorManager.isPC(rSource)) or (RR.isManualSaveRollNpcOn() and not ActorManager.isPC(rSource))) then
+		if rRoll.bPopup and (not (RR.isManualSaveRollPcOn() and isPlayerControlled(rSource)) or (RR.isManualSaveRollNpcOn() and not isPlayerControlled(rSource))) then
 			local rThrow = ActionsManager.buildThrow(rSource, vTargets, rRoll, true);
 			Comm.throwDice(rThrow);
 		else
@@ -161,20 +194,65 @@ function notifyApplyRoll(rRoll, rSource, vTargets)
 --TODO:maybe make a loop through the roll object with object constructors and then loop through on the other end?
 end
 
+
+-- Determine the Player that owns this NPC.
+function getCohortOwner(rSource)
+	local nodeCohort = DB.findNode(rSource.sCreatureNode);
+	local owner;
+	if nodeCohort then
+		owner = nodeCohort.getOwner();
+	end
+	return owner;
+end
+
+-- Determine the PC owner of the NPC.
+--    This is done by repeatedly backing up the tree until a charsheet is found.
+--    This needs to be done since the lineage of a PC-controlled NPC can be PC->NPC->NPC... since NPCs can own NPCs.
+function getCohortsPC(rSource)
+	local nodeCohort = DB.findNode(rSource.sCreatureNode);
+	local pc = nil;
+	if  nodeCohort then
+		local parent = nodeCohort.getParent();
+		pc = nodeCohort;
+		while (parent and parent.getName() ~= "charsheet") do
+			pc = parent;
+			if RR.bDebug then Debug.chat("searching:", pc.getName()); end
+			parent = pc.getParent();
+		end
+	end
+	return pc.getName();
+end
+
 ---This determines whether to broadcast or handle the oobmsg locally.
 ---This is a separate function from the notifyApplyRoll so that I can use the return to end execution early
 ---@param rSource table	passed through from notifyApplyRoll, determines who the message gets sent to
 ---@param msgOOB string the message from notifyApplyRoll
 function needsBroadcast(rSource, msgOOB)
     local sTargetNodeType, nodeTarget = ActorManager.getTypeAndNode(rSource);
-	if nodeTarget and (sTargetNodeType == "pc") then
+
+	if nodeTarget and isPlayerControlled(nodeTarget) then
 		if Session.IsHost then
-			local sOwner = DB.getOwner(nodeTarget);
+			local sOwner;
+			if sTargetNodeType == "pc" then
+				sOwner = DB.getOwner(nodeTarget);
+			else
+				sOwner = getCohortOwner(rSource);
+			end
+			if RR.bDebug then Debug.chat("owner",sOwner); end
+
 			if sOwner ~= "" then
 				for _,vUser in ipairs(User.getActiveUsers()) do
 					if vUser == sOwner then
+						local pcname;
+						if sTargetNodeType == "pc" then
+							pcname = nodeTarget.getName();
+						else
+							pcname = getCohortsPC(rSource);
+						end
+						if RR.bDebug then Debug.chat("pcname",pcname); end
+
 						for _,vIdentity in ipairs(User.getActiveIdentities(vUser)) do
-							if nodeTarget.getName() == vIdentity then
+							if pcname == vIdentity then
 								Comm.deliverOOBMessage(msgOOB, sOwner);
 								return;
 							end
